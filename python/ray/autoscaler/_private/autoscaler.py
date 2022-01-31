@@ -33,7 +33,7 @@ from ray.autoscaler._private.local.node_provider import \
 from ray.autoscaler._private.prom_metrics import AutoscalerPrometheusMetrics
 from ray.autoscaler._private.providers import _get_node_provider
 from ray.autoscaler._private.updater import NodeUpdaterThread
-from ray.autoscaler._private.node_launcher import NodeLauncher
+from ray.autoscaler._private.node_launcher import NodeLauncher, ResourceLauncher
 from ray.autoscaler._private.node_tracker import NodeTracker
 from ray.autoscaler._private.resource_demand_scheduler import \
     get_bin_pack_residual, ResourceDemandScheduler, NodeType, NodeID, NodeIP, \
@@ -49,6 +49,7 @@ from ray.core.generated import gcs_service_pb2, gcs_service_pb2_grpc
 from six.moves import queue
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 # Tuple of modified fields for the given node_id returned by should_update
 # that will be passed into a NodeUpdaterThread.
@@ -199,6 +200,19 @@ class StandardAutoscaler:
         # failed nodes. It is best effort only.
         self.node_tracker = NodeTracker()
 
+        # Resource launchers
+        self.resource_launch_queue = queue.Queue()
+        self.pending_cpu = ConcurrentCounter()
+        for i in range(int(max_batches)):
+            resource_launcher = ResourceLauncher(
+                self.provider,
+                self.resource_launch_queue,
+                self.pending_cpu,
+                i
+            )
+            resource_launcher.daemon = True
+            resource_launcher.start()
+
         # Expand local file_mounts to allow ~ in the paths. This can't be done
         # earlier when the config is written since we might be on different
         # platform and the expansion would result in wrong path.
@@ -233,6 +247,70 @@ class StandardAutoscaler:
                                 "Too many errors, abort.")
                 raise e
 
+    def launch_fleet(self, count: int) -> None:
+        logger.info("StandardAutoscaler: Queue {} new CPUs for launch".format(count))
+        self.pending_cpu.inc(None, count)
+        config = copy.deepcopy(self.config)
+        self.resource_launch_queue.put((config, count))
+
+    def launch_resources(self, now):
+        # nodes = self.workers()
+        # # Check pending nodes immediately after fetching the number of running
+        # # nodes to minimize chance number of pending nodes changing after
+        # # additional nodes (managed and unmanaged) are launched.
+        # self.load_metrics.prune_active_ips([
+        #     self.provider.internal_ip(node_id)
+        #     for node_id in self.all_workers()
+        # ])
+
+        # target_cpu = self.target_cpu()
+        # current_cpu = self.provider.non_terminated_cpu(
+        #     {TAG_RAY_NODE_KIND: NODE_KIND_WORKER})
+        #
+        # if current_cpu > target_cpu:
+        #     if "CPU" in self.resource_requests:
+        #         del self.resource_requests["CPU"]
+
+        # self.log_info_string_cpu(nodes, current_cpu, target_cpu)
+
+        # Terminate any idle or out of date nodes
+        last_used = self.load_metrics.last_used_time_by_ip
+        horizon = now - (60 * self.config["idle_timeout_minutes"])
+
+        # nodes_to_terminate = []
+        # for node_id in nodes:
+        #     node_ip = self.provider.internal_ip(node_id)
+        #     cpu_to_terminate = self._cpu_resource_for_nodes(nodes_to_terminate)
+        #     if ((node_ip in last_used and last_used[node_ip] < horizon) and
+        #         (current_cpu - cpu_to_terminate > target_cpu)):
+        #         logger.info("StandardAutoscaler: "
+        #                     "{}: Terminating idle node".format(node_id))
+        #         nodes_to_terminate.append(node_id)
+        #     elif not self.launch_config_ok(node_id):
+        #         logger.info("StandardAutoscaler: "
+        #                     "{}: Terminating outdated node".format(node_id))
+        #         nodes_to_terminate.append(node_id)
+
+        # if nodes_to_terminate:
+        #     self.provider.terminate_nodes(nodes_to_terminate)
+        #     nodes = self.workers()
+        #     self.log_info_string_cpu(nodes, current_cpu, target_cpu)
+
+        # cpu_to_launch = target_cpu - current_cpu - self.pending_cpu.value
+        # if cpu_to_launch > 0:
+        #     logger.info("StandardAutoscaler: Launching %s CPU. "
+        #                 "(target: %s, current: %s, pending: %s)",
+        #                 cpu_to_launch,
+        #                 target_cpu, current_cpu, self.pending_cpu.value)
+        #     self.launch_cpu(cpu_to_launch)
+        #     self.log_info_string_cpu(nodes, current_cpu, target_cpu)
+        # else:
+        #     self.bringup = False
+
+        # self.log_info_string_cpu(nodes, current_cpu, target_cpu)
+
+        # return nodes, current_cpu, target_cpu
+
     def _update(self):
         now = time.time()
         # Throttle autoscaling updates to this interval to avoid exceeding
@@ -263,9 +341,13 @@ class StandardAutoscaler:
                 ensure_min_cluster_size=self.load_metrics.
                 get_resource_requests()))
         self._report_pending_infeasible(unfulfilled)
+        logger.info(f"autoscaler demand: {to_launch}, {unfulfilled}")
 
         if not self.provider.is_readonly():
-            self.launch_required_nodes(to_launch)
+            if to_launch:
+                logger.info("Trying to launch a fleet instead!")
+                self.launch_fleet(1)
+            # self.launch_required_nodes(to_launch)
 
             if self.disable_node_updaters:
                 self.terminate_unhealthy_nodes(now)

@@ -1,3 +1,4 @@
+import uuid
 import copy
 import threading
 from collections import defaultdict, OrderedDict
@@ -25,6 +26,7 @@ from ray.autoscaler._private.aws.cloudwatch.cloudwatch_helper import \
     CLOUDWATCH_AGENT_INSTALLED_TAG
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 TAG_BATCH_DELAY = 1
 
@@ -152,6 +154,7 @@ class AWSNodeProvider(NodeProvider):
                  for x in node.tags})
 
         self.cached_nodes = {node.id: node for node in nodes}
+        logger.info(f"non-terminated aws nodes: {nodes}")
         return [node.id for node in nodes]
 
     def is_running(self, node_id):
@@ -165,7 +168,7 @@ class AWSNodeProvider(NodeProvider):
 
     def node_tags(self, node_id):
         with self.tag_cache_lock:
-            d1 = self.tag_cache[node_id]
+            d1 = self.tag_cache.get(node_id, {})
             d2 = self.tag_cache_pending.get(node_id, {})
             return dict(d1, **d2)
 
@@ -217,7 +220,7 @@ class AWSNodeProvider(NodeProvider):
         for node_id, tags in self.tag_cache_pending.items():
             for x in tags.items():
                 batch_updates[x].append(node_id)
-            self.tag_cache[node_id].update(tags)
+            self.tag_cache.get(node_id, defaultdict(dict)).update(tags)
 
         self.tag_cache_pending = defaultdict(dict)
 
@@ -237,6 +240,198 @@ class AWSNodeProvider(NodeProvider):
                     }],
                 )
 
+    def delete_fleets(self):
+        fleets = self.ec2_fail_fast.meta.client.describe_fleets()['Fleets']
+        fleet_ids = []
+        for fleet in fleets:
+            fleet_ids.append(fleet['FleetId'])
+        self.ec2_fail_fast.meta.client.delete_fleets(FleetIds=fleet_ids, TerminateInstances=True)
+
+    def _set_tags_for_fleet_instances(self, fleet_id, instance_tags):
+        fleet_instances = self.ec2_fail_fast.meta.client.describe_fleet_instances(FleetId=fleet_id)
+        logger.info(fleet_instances)
+        for instance in fleet_instances['ActiveInstances']:
+            if not self.node_tags(instance['InstanceId']):
+                tags = copy.deepcopy(instance_tags)
+                tags[TAG_RAY_USER_NODE_TYPE] = instance['InstanceType']
+                logger.info(f"Setting tags: {instance_tags} on {instance['InstanceId']}")
+                self.set_node_tags(instance['InstanceId'], tags)
+
+    def _get_existing_fleet(self):
+        fleets = self.ec2_fail_fast.meta.client.describe_fleets(
+            Filters=[
+                {
+                    'Name': 'fleet-state',
+                    'Values': ['submitted', 'active']
+                }
+            ]
+        )['Fleets']
+        for fleet in fleets:
+            for tag in fleet['Tags']:
+                if tag['Key'] == 'ray-fleet-name' and tag['Value'] == self.cluster_name:
+                    return fleet
+        return None
+
+    def _existing_fleet(self, instance_tags):
+        fleet = self._get_existing_fleet()
+        if fleet:
+            logger.info(f"Found existing active fleet for: {self.cluster_name}")
+            self._set_tags_for_fleet_instances(fleet['FleetId'], instance_tags)
+            return True
+        return False
+
+    def launch_resources(self, tags):
+        instance_tags = {
+            **to_aws_format(tags),
+            TAG_RAY_CLUSTER_NAME: self.cluster_name,
+        }
+        logger.info(f"instance tags: {instance_tags}")
+
+        if self._existing_fleet(instance_tags):
+            return
+
+        # def make_tags(launch_spec_id, launch_spec):
+        #     tag_dict = {
+        #         **tags,
+        #         TAG_RAY_FLEET_CPU: str(launch_spec["cpu"]),
+        #         TAG_RAY_FLEET_LAUNCH_SPEC: launch_spec_id
+        #     }
+        #     return [{"Key": k, "Value": v} for k, v in tag_dict.items()]
+
+        instance_config = [
+            # {
+            #     'type': 'p3.16xlarge',
+            #     'weight': 8.0,
+            #     'priority': 0
+            # },
+            # {
+            #     'type': 'p3.8xlarge',
+            #     'weight': 4.0,
+            #     'priority': 0
+            # },
+            {
+                'type': 'p3.2xlarge',
+                'weight': 1.0,
+                'priority': 0
+            },
+            # {
+            #     'type': 'p2.16xlarge',
+            #     'weight': 16.0,
+            #     'priority': 0
+            # },
+            # {
+            #     'type': 'p2.8xlarge',
+            #     'weight': 8.0,
+            #     'priority': 0
+            # },
+            {
+                'type': 'p2.xlarge',
+                'weight': 1.0,
+                'priority': 2
+            },
+            # {
+            #     'type': 'g4dn.16xlarge',
+            #     'weight': 1.0,
+            #     'priority': 1
+            # },
+            # {
+            #     'type': 'g4dn.12xlarge',
+            #     'weight': 4.0,
+            #     'priority': 0
+            # },
+            # {
+            #     'type': 'g4dn.8xlarge',
+            #     'weight': 1.0,
+            #     'priority': 1
+            # },
+            {
+                'type': 'g4dn.4xlarge',
+                'weight': 1.0,
+                'priority': 2
+            },
+            {
+                'type': 'g4dn.2xlarge',
+                'weight': 1.0,
+                'priority': 1
+            },
+            {
+                'type': 'g4dn.xlarge',
+                'weight': 1.0,
+                'priority': 2
+            },
+        ]
+
+        instance_overrides = [
+            {
+                'InstanceType': i['type'],
+                'SubnetId': '',
+                'WeightedCapacity': i['weight'],
+                'Priority': i['priority'],
+            } for i in instance_config
+        ]
+
+        target_capacity = 4
+        fleet_config = {
+            'ClientToken': str(uuid.uuid4()),
+            'SpotOptions': {
+                'AllocationStrategy': 'capacity-optimized-prioritized',
+                'MaintenanceStrategies': {
+                    'CapacityRebalance': {
+                        'ReplacementStrategy': 'launch-before-terminate',
+                        'TerminationDelay': 600,
+                    },
+                },
+            },
+            'OnDemandOptions': {
+                'AllocationStrategy': 'prioritized',
+            },
+            'LaunchTemplateConfigs': [
+                {
+                    'LaunchTemplateSpecification': {
+                        'LaunchTemplateId': '',
+                        'Version': '$Latest'
+                    },
+                    'Overrides': instance_overrides,
+                },
+            ],
+            'TargetCapacitySpecification': {
+                'TotalTargetCapacity': target_capacity,
+                'OnDemandTargetCapacity': 2,
+                'SpotTargetCapacity': 2,
+                'DefaultTargetCapacityType': 'on-demand',
+            },
+            'ExcessCapacityTerminationPolicy': 'termination',
+            'TerminateInstancesWithExpiration': True,
+            'ReplaceUnhealthyInstances': True,
+            'TagSpecifications': [
+                {
+                    'ResourceType': 'fleet',
+                    'Tags': [
+                        {
+                            'Key': 'ray-fleet-name',
+                            'Value': self.cluster_name
+                        }
+                    ]
+                }
+            ]
+        }
+
+        response = self.ec2_fail_fast.meta.client.create_fleet(**fleet_config)
+        logger.info(f'EC2 fleet request response: {response}')
+
+        fleet_id = response['FleetId']
+        while True:
+            fleets = self.ec2_fail_fast.meta.client.describe_fleets(FleetIds=[fleet_id])['Fleets']
+            if len(fleets) > 0:
+                fleet = fleets[0]
+                logger.info(f"Fleet {fleet_id} has been created. Waiting for instances.")
+                fulfilled_capacity = fleet['FulfilledCapacity']
+                if fulfilled_capacity > 0:
+                    self._set_tags_for_fleet_instances(fleet_id, instance_tags)
+                if fulfilled_capacity >= fleet['TargetCapacitySpecification']['TotalTargetCapacity']:
+                    break
+            time.sleep(5)
+
     def create_node(self, node_config, tags, count) -> Dict[str, Any]:
         """Creates instances.
 
@@ -245,6 +440,8 @@ class AWSNodeProvider(NodeProvider):
         """
         # sort tags by key to support deterministic unit test stubbing
         tags = OrderedDict(sorted(copy.deepcopy(tags).items()))
+
+        logger.info(node_config)
 
         reused_nodes_dict = {}
         # Try to reuse previously stopped nodes with compatible configs

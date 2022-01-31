@@ -12,6 +12,55 @@ from ray.autoscaler._private.prom_metrics import AutoscalerPrometheusMetrics
 from ray.autoscaler._private.util import hash_launch_conf
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+
+class ResourceLauncher(threading.Thread):
+    """
+    Interface for using resources in a Cloud, ie. delegating node management to the Cloud in question.
+    """
+
+    def __init__(self, provider, queue, pending, index):
+        self.provider = provider
+        self.queue = queue
+        self.pending = pending
+        self.index = index
+
+        super(ResourceLauncher, self).__init__()
+
+    def _launch_resources(self, config, num_cpus):
+        launch_hash = hash_launch_conf({}, config["auth"])
+        node_tags = {
+            TAG_RAY_NODE_NAME: "ray-{}-worker".format(config["cluster_name"]),
+            TAG_RAY_NODE_KIND: NODE_KIND_WORKER,
+            TAG_RAY_NODE_STATUS: STATUS_UNINITIALIZED,
+            TAG_RAY_LAUNCH_CONFIG: launch_hash,
+        }
+
+        # #########
+
+        # worker_filter = {TAG_RAY_NODE_KIND: NODE_KIND_WORKER}
+        # before = self.provider.non_terminated_cpu(tag_filters=worker_filter)
+        # self.provider.create_cpu(config["fleet"], node_tags, num_cpus)
+        self.provider.launch_resources(node_tags)
+        # after = self.provider.non_terminated_cpu(tag_filters=worker_filter)
+
+        # if after <= before:
+        #     self.log("No new nodes reported after node creation.")
+
+    def run(self):
+        while True:
+            config, num_cpus = self.queue.get()
+            self.log("Got {} CPU to launch.".format(num_cpus))
+            try:
+                self._launch_resources(config, num_cpus)
+            except Exception:
+                logger.exception("Launch failed")
+            finally:
+                self.pending.dec(None, num_cpus)
+
+    def log(self, statement):
+        logger.info(f'ResourceLauncher {self.index}: {statement}"')
 
 
 class NodeLauncher(threading.Thread):
